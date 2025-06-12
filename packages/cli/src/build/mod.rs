@@ -11,6 +11,7 @@
 mod assets;
 mod builder;
 mod context;
+mod ejected_assets;
 mod patch;
 mod request;
 mod tools;
@@ -18,6 +19,7 @@ mod tools;
 pub(crate) use assets::*;
 pub(crate) use builder::*;
 pub(crate) use context::*;
+pub(crate) use ejected_assets::*;
 pub(crate) use patch::*;
 pub(crate) use request::*;
 pub(crate) use tools::*;

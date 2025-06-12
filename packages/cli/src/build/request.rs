@@ -3584,7 +3584,24 @@ impl BuildRequest {
         Ok(())
     }
 
+    /// Check if there are ejected assets for the current platform and return their path if they exist
+    pub(crate) fn ejected_assets_dir(&self) -> Option<PathBuf> {
+        let project_dir = &self.workspace_dir();
+        
+        match self.platform {
+            Platform::Android => EjectedAssets::android_assets_dir(project_dir),
+            Platform::Ios => EjectedAssets::ios_assets_dir(project_dir),
+            _ => None,
+        }
+    }
+
     pub(crate) fn asset_dir(&self) -> PathBuf {
+        // Check if there are ejected assets for this platform
+        if let Some(ejected_dir) = self.ejected_assets_dir() {
+            return ejected_dir;
+        }
+        
+        // If no ejected assets, use the default asset directory
         match self.platform {
             Platform::MacOS => self
                 .root_dir()
