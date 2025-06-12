@@ -3589,8 +3589,8 @@ impl BuildRequest {
         let project_dir = &self.workspace_dir();
         
         match self.platform {
-            Platform::Android => EjectedAssets::android_assets_dir(project_dir),
-            Platform::Ios => EjectedAssets::ios_assets_dir(project_dir),
+            Platform::Android => crate::build::ejected_assets::EjectedAssets::android_assets_dir(project_dir),
+            Platform::Ios => crate::build::ejected_assets::EjectedAssets::ios_assets_dir(project_dir),
             _ => None,
         }
     }
