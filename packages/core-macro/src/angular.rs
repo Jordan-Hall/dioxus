@@ -878,16 +878,22 @@ fn render_interpolated_string(source: &str) -> String {
 }
 
 fn inject_track_keys(nodes: &mut [Node], track: &str) {
-    for node in nodes {
+    let multiple_roots = nodes.len() > 1;
+    for (index, node) in nodes.iter_mut().enumerate() {
+        let track_key = if multiple_roots {
+            format!("{track}:{index}")
+        } else {
+            track.to_owned()
+        };
         match node {
             Node::Element(el) => el.attrs.insert(0, Attribute {
                 name: "key".to_owned(),
                 value: None,
-                kind: AttributeKind::Generated(format!("\"{{{track}}}\"")),
+                kind: AttributeKind::Generated(format!("\"{{{track_key}}}\"")),
             }),
             Node::If { branches, otherwise, .. } => {
-                for (_, body) in branches { inject_track_keys(body, track); }
-                if let Some(body) = otherwise { inject_track_keys(body, track); }
+                for (_, body) in branches { inject_track_keys(body, &track_key); }
+                if let Some(body) = otherwise { inject_track_keys(body, &track_key); }
             }
             _ => {}
         }
@@ -1296,6 +1302,18 @@ mod tests {
         assert!(rsx.contains("let total = __angular_count"));
         assert!(rsx.contains("{__angular_even}"));
         assert!(rsx.contains("key: \"{item.id}\""));
+    }
+
+    #[test]
+    fn gives_multiple_roots_distinct_tracking_keys() {
+        let rsx = lower(
+            r#"@for (item of items; track item.id) {
+                <span>{{ item.name }}</span>
+                <small>{{ item.id }}</small>
+            }"#,
+        );
+        assert!(rsx.contains("key: \"{item.id}:0\""));
+        assert!(rsx.contains("key: \"{item.id}:1\""));
     }
 
     #[test]
