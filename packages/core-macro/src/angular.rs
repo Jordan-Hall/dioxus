@@ -1,0 +1,1407 @@
+use proc_macro::TokenStream;
+use proc_macro2::Span;
+use quote::ToTokens;
+use syn::{Error, LitStr};
+
+use crate::rsx;
+
+#[derive(Clone, Debug)]
+enum Node {
+    Text(String),
+    Element(Element),
+    If { branches: Vec<(String, Vec<Node>)>, otherwise: Option<Vec<Node>>, alias: Option<String> },
+    For {
+        pattern: String,
+        iterable: String,
+        track: String,
+        aliases: Vec<(String, String)>,
+        body: Vec<Node>,
+        empty: Option<Vec<Node>>,
+    },
+    Switch { expression: String, cases: Vec<(Option<String>, Vec<Node>)> },
+    Let { name: String, expression: String },
+    Defer { body: Vec<Node>, placeholder: Option<Vec<Node>>, loading: Option<Vec<Node>>, error: Option<Vec<Node>> },
+    Boundary { body: Vec<Node>, error: Option<Vec<Node>> },
+}
+
+#[derive(Clone, Debug)]
+struct Element {
+    name: String,
+    attrs: Vec<Attribute>,
+    children: Vec<Node>,
+}
+
+#[derive(Clone, Debug)]
+struct Attribute {
+    name: String,
+    value: Option<String>,
+    kind: AttributeKind,
+}
+
+#[derive(Clone, Debug)]
+enum AttributeKind {
+    Static,
+    Property(String),
+    Event(String),
+    TwoWay(String),
+    Reference(String),
+    Generated(String),
+}
+
+struct Parser<'a> {
+    source: &'a str,
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(source: &'a str) -> Self {
+        Self { source, pos: 0 }
+    }
+
+    fn parse(mut self) -> Result<Vec<Node>, String> {
+        let nodes = self.parse_nodes(None, false, None)?;
+        self.skip_ws();
+        if self.pos != self.source.len() {
+            return self.error("unexpected trailing template input");
+        }
+        Ok(nodes)
+    }
+
+    fn parse_nodes(
+        &mut self,
+        stop_tag: Option<&str>,
+        stop_brace: bool,
+        stop_control: Option<&str>,
+    ) -> Result<Vec<Node>, String> {
+        let mut nodes = Vec::new();
+        while self.pos < self.source.len() {
+            if self.starts_with("<!--") {
+                self.skip_comment()?;
+                continue;
+            }
+            if let Some(control) = stop_control {
+                if self.at_control(control) {
+                    return Ok(nodes);
+                }
+            }
+            if stop_brace && self.starts_with("}") {
+                self.pos += 1;
+                return Ok(nodes);
+            }
+            if self.starts_with("</") {
+                let closing = self.parse_closing_tag()?;
+                match stop_tag {
+                    Some(expected) if expected.eq_ignore_ascii_case(&closing) => return Ok(nodes),
+                    Some(expected) => return self.error(&format!("closing tag </{closing}> does not match <{expected}>")),
+                    None => return self.error(&format!("unexpected closing tag </{closing}>")),
+                }
+            }
+            if self.is_tag_start() {
+                nodes.push(Node::Element(self.parse_element()?));
+                continue;
+            }
+            if self.starts_with("@") {
+                if let Some(node) = self.try_parse_control()? {
+                    nodes.push(node);
+                    continue;
+                }
+            }
+            let text = self.parse_text(stop_brace)?;
+            if !text.is_empty() {
+                nodes.push(Node::Text(text));
+            } else if self.pos < self.source.len() {
+                return self.error("unable to parse template text");
+            }
+        }
+        if let Some(tag) = stop_tag {
+            return self.error(&format!("missing closing tag </{tag}>"));
+        }
+        if stop_brace {
+            return self.error("missing closing brace for Angular control-flow block");
+        }
+        Ok(nodes)
+    }
+
+    fn try_parse_control(&mut self) -> Result<Option<Node>, String> {
+        if self.at_control("if") { return self.parse_if().map(Some); }
+        if self.at_control("for") { return self.parse_for().map(Some); }
+        if self.at_control("switch") { return self.parse_switch().map(Some); }
+        if self.at_control("let") { return self.parse_let().map(Some); }
+        if self.at_control("defer") { return self.parse_defer().map(Some); }
+        if self.at_control("boundary") { return self.parse_boundary().map(Some); }
+        Ok(None)
+    }
+
+    fn parse_if(&mut self) -> Result<Node, String> {
+        self.consume_control("if")?;
+        let header = self.read_parenthesized()?;
+        let (condition, alias) = split_once_top_level(&header, ';')
+            .map(|(condition, rest)| {
+                let suffix = rest.trim();
+                let alias = suffix.strip_prefix("as ").map(str::trim).map(str::to_owned);
+                (condition.trim().to_owned(), alias)
+            })
+            .unwrap_or((header.trim().to_owned(), None));
+        if let Some(alias) = alias.as_deref() {
+            if !is_rust_ident(alias) {
+                return self.error("@if alias must be a Rust identifier");
+            }
+        }
+        if condition.is_empty() {
+            return self.error("@if requires a condition");
+        }
+
+        let mut branches = vec![(condition, self.parse_block()?)];
+        let mut otherwise = None;
+        loop {
+            let previous = self.pos;
+            self.skip_ws();
+            if self.at_control("else") {
+                self.consume_control("else")?;
+                self.skip_ws();
+                if self.at_control("if") {
+                    self.consume_control("if")?;
+                    let condition = self.read_parenthesized()?.trim().to_owned();
+                    branches.push((condition, self.parse_block()?));
+                } else {
+                    otherwise = Some(self.parse_block()?);
+                    break;
+                }
+            } else {
+                self.pos = previous;
+                break;
+            }
+        }
+        Ok(Node::If { branches, otherwise, alias })
+    }
+
+    fn parse_for(&mut self) -> Result<Node, String> {
+        self.consume_control("for")?;
+        let header = self.read_parenthesized()?;
+        let mut parts = split_top_level(&header, ';');
+        let main = parts.remove(0).trim().to_owned();
+        let Some((pattern, iterable)) = split_once_word(&main, "of") else {
+            return self.error("Angular @for syntax is: @for (item of items; track item.id) { ... }");
+        };
+        let pattern = pattern.trim().to_owned();
+        let iterable = iterable.trim().to_owned();
+        if pattern.is_empty() || iterable.is_empty() {
+            return self.error("@for requires both an item pattern and an iterable");
+        }
+
+        let mut track = None;
+        let mut aliases: Vec<(String, String)> = Vec::new();
+        for part in parts {
+            let part = part.trim();
+            if let Some(expr) = part.strip_prefix("track ") {
+                if track.is_some() {
+                    return self.error("@for may contain only one track clause");
+                }
+                if expr.trim().is_empty() {
+                    return self.error("@for track clause requires an expression");
+                }
+                track = Some(expr.trim().to_owned());
+            } else if let Some(declarations) = part.strip_prefix("let ") {
+                for declaration in split_top_level(declarations, ',') {
+                    let Some((name, context)) = split_once_top_level(&declaration, '=') else {
+                        return self.error("loop aliases use `let alias = $index`");
+                    };
+                    let name = name.trim().to_owned();
+                    let context = context.trim().to_owned();
+                    if !is_rust_ident(&name) {
+                        return self.error("loop alias must be a Rust identifier");
+                    }
+                    if !matches!(context.as_str(), "$index" | "$count" | "$first" | "$last" | "$even" | "$odd") {
+                        return self.error(&format!("unknown Angular loop context variable `{context}`"));
+                    }
+                    if aliases.iter().any(|existing| existing.0 == name) {
+                        return self.error(&format!("duplicate loop alias `{name}`"));
+                    }
+                    aliases.push((name, context));
+                }
+            } else if !part.is_empty() {
+                return self.error(&format!("unsupported @for clause: {part}"));
+            }
+        }
+
+        let Some(mut track) = track else {
+            return self.error("@for requires a track expression, for example `track item.id`");
+        };
+        let mut body = self.parse_block()?;
+        rewrite_loop_locals(&mut body);
+        track = rewrite_expression_loop_locals(&track);
+        inject_track_keys(&mut body, &track);
+
+        let previous = self.pos;
+        self.skip_ws();
+        let empty = if self.at_control("empty") {
+            self.consume_control("empty")?;
+            Some(self.parse_block()?)
+        } else {
+            self.pos = previous;
+            None
+        };
+
+        Ok(Node::For { pattern, iterable, track, aliases, body, empty })
+    }
+
+    fn parse_switch(&mut self) -> Result<Node, String> {
+        self.consume_control("switch")?;
+        let expression = self.read_parenthesized()?.trim().to_owned();
+        if expression.is_empty() {
+            return self.error("@switch requires an expression");
+        }
+        self.skip_ws();
+        self.expect_char('{')?;
+        let mut cases = Vec::new();
+        let mut has_default = false;
+        loop {
+            self.skip_ws();
+            if self.pos >= self.source.len() {
+                return self.error("missing closing brace for @switch");
+            }
+            if self.starts_with("}") {
+                self.pos += 1;
+                break;
+            }
+            if self.at_control("case") {
+                if has_default {
+                    return self.error("@case cannot appear after @default");
+                }
+                self.consume_control("case")?;
+                let value = self.read_parenthesized()?.trim().to_owned();
+                if value.is_empty() {
+                    return self.error("@case requires an expression");
+                }
+                cases.push((Some(value), self.parse_block()?));
+                continue;
+            }
+            if self.at_control("default") {
+                if has_default {
+                    return self.error("@switch may contain only one @default");
+                }
+                self.consume_control("default")?;
+                has_default = true;
+                cases.push((None, self.parse_block()?));
+                continue;
+            }
+            return self.error("@switch can contain only @case and @default blocks");
+        }
+        if cases.is_empty() {
+            return self.error("@switch requires at least one @case or @default");
+        }
+        Ok(Node::Switch { expression, cases })
+    }
+
+    fn parse_let(&mut self) -> Result<Node, String> {
+        self.consume_control("let")?;
+        let statement = self.read_statement()?;
+        let Some((name, expression)) = split_once_top_level(&statement, '=') else {
+            return self.error("Angular @let syntax is: @let name = expression;");
+        };
+        let name = name.trim().to_owned();
+        let expression = expression.trim().to_owned();
+        if !is_rust_ident(&name) {
+            return self.error("@let name must be a Rust identifier");
+        }
+        if expression.is_empty() {
+            return self.error("@let requires an expression");
+        }
+        Ok(Node::Let { name, expression })
+    }
+
+    fn parse_defer(&mut self) -> Result<Node, String> {
+        self.consume_control("defer")?;
+        self.skip_ws();
+        let _triggers = if self.peek_char() == Some('(') { Some(self.read_parenthesized()?) } else { None };
+        let body = self.parse_block()?;
+        let mut placeholder = None;
+        let mut loading = None;
+        let mut error = None;
+        loop {
+            let previous = self.pos;
+            self.skip_ws();
+            if self.at_control("placeholder") {
+                self.consume_control("placeholder")?;
+                self.skip_optional_parenthesized()?;
+                if placeholder.replace(self.parse_block()?).is_some() {
+                    return self.error("@defer may contain only one @placeholder block");
+                }
+            } else if self.at_control("loading") {
+                self.consume_control("loading")?;
+                self.skip_optional_parenthesized()?;
+                if loading.replace(self.parse_block()?).is_some() {
+                    return self.error("@defer may contain only one @loading block");
+                }
+            } else if self.at_control("error") {
+                self.consume_control("error")?;
+                if error.replace(self.parse_block()?).is_some() {
+                    return self.error("@defer may contain only one @error block");
+                }
+            } else {
+                self.pos = previous;
+                break;
+            }
+        }
+        Ok(Node::Defer { body, placeholder, loading, error })
+    }
+
+    fn parse_boundary(&mut self) -> Result<Node, String> {
+        self.consume_control("boundary")?;
+        self.skip_ws();
+        self.expect_char('{')?;
+        let body = self.parse_nodes(None, true, None)?;
+        let previous = self.pos;
+        self.skip_ws();
+        let mut error = None;
+        if self.at_control("error") {
+            self.consume_control("error")?;
+            self.skip_ws();
+            if self.peek_char() == Some('(') {
+                let parameters = self.read_parenthesized()?;
+                if !parameters.trim().is_empty() {
+                    return self.error("conditional @error blocks are not supported yet; use one unconditional @error block");
+                }
+            }
+            error = Some(self.parse_block()?);
+            let next = self.pos;
+            self.skip_ws();
+            if self.at_control("error") {
+                return self.error("only one unconditional @error block is supported for @boundary");
+            }
+            self.pos = next;
+        } else {
+            self.pos = previous;
+        }
+        Ok(Node::Boundary { body, error })
+    }
+
+    fn parse_block(&mut self) -> Result<Vec<Node>, String> {
+        self.skip_ws();
+        self.expect_char('{')?;
+        self.parse_nodes(None, true, None)
+    }
+
+    fn skip_optional_parenthesized(&mut self) -> Result<(), String> {
+        self.skip_ws();
+        if self.peek_char() == Some('(') {
+            self.read_parenthesized()?;
+        }
+        Ok(())
+    }
+
+    fn parse_element(&mut self) -> Result<Element, String> {
+        self.expect_char('<')?;
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() || ch == '/' || ch == '>' { break; }
+            self.bump_char();
+        }
+        if start == self.pos {
+            return self.error("expected an element name after <");
+        }
+        let name = self.source[start..self.pos].to_owned();
+        let mut attrs = Vec::new();
+        let mut self_closing = false;
+        loop {
+            self.skip_ws();
+            if self.starts_with("/>") {
+                self.pos += 2;
+                self_closing = true;
+                break;
+            }
+            if self.starts_with(">") {
+                self.pos += 1;
+                break;
+            }
+            if self.pos >= self.source.len() {
+                return self.error("unterminated opening tag");
+            }
+            let attr_start = self.pos;
+            while let Some(ch) = self.peek_char() {
+                if ch.is_whitespace() || ch == '=' || ch == '>' || ch == '/' { break; }
+                self.bump_char();
+            }
+            if attr_start == self.pos {
+                return self.error("invalid attribute syntax");
+            }
+            let raw_name = self.source[attr_start..self.pos].to_owned();
+            self.skip_ws();
+            let value = if self.consume_if("=") {
+                self.skip_ws();
+                Some(self.read_attribute_value()?)
+            } else { None };
+            attrs.push(parse_attribute(raw_name, value));
+        }
+        let children = if self_closing || is_void_element(&name) {
+            Vec::new()
+        } else {
+            self.parse_nodes(Some(&name), false, None)?
+        };
+        Ok(Element { name, attrs, children })
+    }
+
+    fn parse_closing_tag(&mut self) -> Result<String, String> {
+        self.pos += 2;
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() || ch == '>' { break; }
+            self.bump_char();
+        }
+        if start == self.pos { return self.error("expected closing tag name"); }
+        let name = self.source[start..self.pos].to_owned();
+        self.skip_ws();
+        self.expect_char('>')?;
+        Ok(name)
+    }
+
+    fn read_attribute_value(&mut self) -> Result<String, String> {
+        let Some(first) = self.peek_char() else { return self.error("expected attribute value"); };
+        if first == '"' || first == '\'' {
+            self.bump_char();
+            let start = self.pos;
+            while let Some(ch) = self.peek_char() {
+                if ch == first {
+                    let value = self.source[start..self.pos].to_owned();
+                    self.bump_char();
+                    return Ok(decode_html_entities(&value));
+                }
+                self.bump_char();
+            }
+            return self.error("unterminated quoted attribute value");
+        }
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() || ch == '>' || (ch == '/' && self.starts_with("/>")) { break; }
+            self.bump_char();
+        }
+        Ok(decode_html_entities(&self.source[start..self.pos]))
+    }
+
+    fn parse_text(&mut self, stop_brace: bool) -> Result<String, String> {
+        let start = self.pos;
+        while self.pos < self.source.len() {
+            if self.starts_with("{{") {
+                if let Some(end) = find_interpolation_end(self.source, self.pos + 2) {
+                    self.pos = end + 2;
+                    continue;
+                }
+                return self.error("unterminated interpolation; expected closing braces");
+            }
+            if self.is_tag_start() || self.starts_with("</")
+                || (self.source[self.pos..].starts_with('@') && self.is_known_control_start())
+                || (stop_brace && self.starts_with("}"))
+            {
+                break;
+            }
+            self.bump_char();
+        }
+        Ok(self.source[start..self.pos].to_owned())
+    }
+
+    fn read_parenthesized(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        self.expect_char('(')?;
+        self.read_balanced('(', ')')
+    }
+
+    fn read_statement(&mut self) -> Result<String, String> {
+        let start = self.pos;
+        let mut depth = 0_i32;
+        let mut quote = None;
+        let mut escaped = false;
+        while let Some(ch) = self.peek_char() {
+            self.bump_char();
+            if let Some(q) = quote {
+                if escaped { escaped = false; }
+                else if ch == '\\' { escaped = true; }
+                else if ch == q { quote = None; }
+                continue;
+            }
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ';' if depth <= 0 => return Ok(self.source[start..self.pos - 1].to_owned()),
+                _ => {}
+            }
+        }
+        self.error("@let statement must end with semicolon")
+    }
+
+    fn read_balanced(&mut self, open: char, close: char) -> Result<String, String> {
+        let start = self.pos;
+        let mut depth = 1_i32;
+        let mut quote = None;
+        let mut escaped = false;
+        while let Some(ch) = self.peek_char() {
+            self.bump_char();
+            if let Some(q) = quote {
+                if escaped { escaped = false; }
+                else if ch == '\\' { escaped = true; }
+                else if ch == q { quote = None; }
+                continue;
+            }
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(self.source[start..self.pos - close.len_utf8()].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.error(&format!("unclosed {open} delimiter"))
+    }
+
+    fn skip_comment(&mut self) -> Result<(), String> {
+        let Some(end) = self.source[self.pos + 4..].find("-->") else {
+            return self.error("unterminated HTML comment");
+        };
+        self.pos += 4 + end + 3;
+        Ok(())
+    }
+
+    fn is_tag_start(&self) -> bool {
+        if !self.starts_with("<") { return false; }
+        let next = self.source[self.pos + 1..].chars().next();
+        matches!(next, Some(ch) if ch.is_ascii_alphabetic() || ch == '!')
+    }
+
+    fn is_known_control_start(&self) -> bool {
+        ["if", "for", "switch", "let", "defer", "boundary", "else", "empty", "case", "default", "placeholder", "loading", "error"]
+            .iter()
+            .any(|name| self.at_control(name))
+    }
+
+    fn at_control(&self, name: &str) -> bool {
+        let prefix = format!("@{name}");
+        if !self.source[self.pos..].starts_with(&prefix) { return false; }
+        self.source[self.pos + prefix.len()..].chars().next()
+            .map_or(true, |ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    }
+
+    fn consume_control(&mut self, name: &str) -> Result<(), String> {
+        if !self.at_control(name) { return self.error(&format!("expected @{name}")); }
+        self.pos += name.len() + 1;
+        Ok(())
+    }
+
+    fn skip_ws(&mut self) {
+        while self.peek_char().is_some_and(char::is_whitespace) { self.bump_char(); }
+    }
+
+    fn expect_char(&mut self, expected: char) -> Result<(), String> {
+        self.skip_ws();
+        if self.peek_char() == Some(expected) {
+            self.bump_char();
+            Ok(())
+        } else {
+            self.error(&format!("expected {expected}"))
+        }
+    }
+
+    fn consume_if(&mut self, expected: &str) -> bool {
+        if self.starts_with(expected) { self.pos += expected.len(); true } else { false }
+    }
+
+    fn starts_with(&self, needle: &str) -> bool { self.source[self.pos..].starts_with(needle) }
+    fn peek_char(&self) -> Option<char> { self.source[self.pos..].chars().next() }
+    fn bump_char(&mut self) { if let Some(ch) = self.peek_char() { self.pos += ch.len_utf8(); } }
+    fn error<T>(&self, message: &str) -> Result<T, String> { Err(format!("{message} at byte {}", self.pos)) }
+}
+
+fn parse_attribute(raw_name: String, value: Option<String>) -> Attribute {
+    if raw_name.starts_with("[(") && raw_name.ends_with(")]") {
+        let name = raw_name[2..raw_name.len() - 2].to_owned();
+        return Attribute { name: name.clone(), value, kind: AttributeKind::TwoWay(name) };
+    }
+    if raw_name.starts_with('[') && raw_name.ends_with(']') {
+        let name = raw_name[1..raw_name.len() - 1].to_owned();
+        return Attribute { name: name.clone(), value, kind: AttributeKind::Property(name) };
+    }
+    if raw_name.starts_with('(') && raw_name.ends_with(')') {
+        let name = raw_name[1..raw_name.len() - 1].to_owned();
+        return Attribute { name: name.clone(), value, kind: AttributeKind::Event(name) };
+    }
+    if let Some(name) = raw_name.strip_prefix("bindon-") {
+        return Attribute { name: name.to_owned(), value, kind: AttributeKind::TwoWay(name.to_owned()) };
+    }
+    if let Some(name) = raw_name.strip_prefix("bind-") {
+        return Attribute { name: name.to_owned(), value, kind: AttributeKind::Property(name.to_owned()) };
+    }
+    if let Some(name) = raw_name.strip_prefix("on-") {
+        return Attribute { name: name.to_owned(), value, kind: AttributeKind::Event(name.to_owned()) };
+    }
+    if raw_name.starts_with('#') || raw_name.starts_with("ref-") {
+        let name = raw_name.strip_prefix('#').or_else(|| raw_name.strip_prefix("ref-")).unwrap_or(&raw_name);
+        return Attribute { name: name.to_owned(), value, kind: AttributeKind::Reference(name.to_owned()) };
+    }
+    Attribute { name: raw_name, value, kind: AttributeKind::Static }
+}
+
+fn render_nodes(nodes: &[Node]) -> Result<String, String> {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < nodes.len() {
+        match &nodes[index] {
+            Node::Let { name, expression } => {
+                let remaining = render_nodes(&nodes[index + 1..])?;
+                out.push_str(&format!("{{ let {name} = {expression}; ::dioxus::prelude::rsx! {{ {remaining} }} }}"));
+                break;
+            }
+            node => {
+                out.push_str(&render_node(node)?);
+                index += 1;
+                if index < nodes.len() { out.push_str(", "); }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn render_node(node: &Node) -> Result<String, String> {
+    match node {
+        Node::Text(text) => Ok(render_interpolated_string(&decode_html_entities(text))),
+        Node::Element(el) => render_element(el),
+        Node::If { branches, otherwise, alias } => {
+            let mut out = String::new();
+            for (index, (condition, body)) in branches.iter().enumerate() {
+                if index > 0 { out.push_str(" else "); }
+                if index == 0 {
+                    if let Some(alias) = alias {
+                        out.push_str(&format!("if let Some({alias}) = ({condition}) {{ {} }}", render_nodes(body)?));
+                    } else {
+                        out.push_str(&format!("if {condition} {{ {} }}", render_nodes(body)?));
+                    }
+                } else {
+                    out.push_str(&format!("if {condition} {{ {} }}", render_nodes(body)?));
+                }
+            }
+            if let Some(body) = otherwise { out.push_str(&format!(" else {{ {} }}", render_nodes(body)?)); }
+            Ok(out)
+        }
+        Node::For { pattern, iterable, aliases, body, empty, .. } => {
+            let body = render_nodes(body)?;
+            let empty = empty.as_ref().map(|nodes| render_nodes(nodes)).transpose()?.unwrap_or_default();
+            let mut context = String::from(
+                "let __angular_first = __angular_index == 0; \
+                 let __angular_last = __angular_index + 1 == __angular_count; \
+                 let __angular_even = __angular_index % 2 == 0; \
+                 let __angular_odd = !__angular_even; "
+            );
+            for (alias, variable) in aliases {
+                let source = match variable.as_str() {
+                    "$index" => "__angular_index",
+                    "$count" => "__angular_count",
+                    "$first" => "__angular_first",
+                    "$last" => "__angular_last",
+                    "$even" => "__angular_even",
+                    "$odd" => "__angular_odd",
+                    _ => return Err(format!("unknown loop context variable {}", variable)),
+                };
+                context.push_str(&format!("let {alias} = {source}; "));
+            }
+
+            let loop_node = format!(
+                "for (__angular_index, {pattern}) in __angular_items.into_iter().enumerate() {{ {{ {context} ::dioxus::prelude::rsx! {{ {body} }} }} }}"
+            );
+            if empty.is_empty() {
+                Ok(format!(
+                    "{{ let __angular_items: ::std::vec::Vec<_> = ({iterable}).into_iter().collect(); let __angular_count = __angular_items.len(); ::dioxus::prelude::rsx! {{ {loop_node} }} }}"
+                ))
+            } else {
+                Ok(format!(
+                    "{{ let __angular_items: ::std::vec::Vec<_> = ({iterable}).into_iter().collect(); let __angular_count = __angular_items.len(); if __angular_items.is_empty() {{ ::dioxus::prelude::rsx! {{ {empty} }} }} else {{ ::dioxus::prelude::rsx! {{ {loop_node} }} }} }}"
+                ))
+            }
+        }
+        Node::Switch { expression, cases } => {
+            let mut out = String::new();
+            for (index, (case, body)) in cases.iter().enumerate() {
+                if index > 0 { out.push_str(" else "); }
+                match case {
+                    Some(case) => out.push_str(&format!("if __angular_switch_value == ({case}) {{ {} }}", render_nodes(body)?)),
+                    None => out.push_str(&format!("if true {{ {} }}", render_nodes(body)?)),
+                }
+            }
+            Ok(format!("{{ let __angular_switch_value = ({expression}); ::dioxus::prelude::rsx! {{ {out} }} }}"))
+        }
+        Node::Defer { body, placeholder, loading, error } => {
+            let fallback = placeholder.as_ref().or(loading.as_ref()).map(|nodes| render_nodes(nodes)).transpose()?.unwrap_or_default();
+            let body = render_nodes(body)?;
+            if let Some(error_nodes) = error {
+                Ok(format!(
+                    "::dioxus::prelude::ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, ::dioxus::prelude::SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }} }}",
+                    render_nodes(error_nodes)?
+                ))
+            } else {
+                Ok(format!("::dioxus::prelude::SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }}"))
+            }
+        }
+        Node::Boundary { body, error } => {
+            if let Some(error) = error {
+                Ok(format!("::dioxus::prelude::ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, {} }}", render_nodes(error)?, render_nodes(body)?))
+            } else {
+                Ok(format!("::dioxus::prelude::ErrorBoundary {{ {} }}", render_nodes(body)?))
+            }
+        }
+        Node::Let { .. } => unreachable!(),
+    }
+}
+
+fn render_element(el: &Element) -> Result<String, String> {
+    let mut fields = Vec::new();
+    for attr in &el.attrs {
+        match &attr.kind {
+            AttributeKind::Static => {
+                let name = render_attribute_name(&attr.name);
+                let value = match attr.value.as_deref() {
+                    Some(value) => render_interpolated_string(value),
+                    None if is_boolean_attribute(&attr.name) => "true".to_owned(),
+                    None => "true".to_owned(),
+                };
+                fields.push(format!("{name}: {value}"));
+            }
+            AttributeKind::Property(name) => {
+                let value = required_value(attr)?;
+                if let Some(property) = name.strip_prefix("attr.") {
+                    fields.push(format!("{}: {{ {value} }}", render_attribute_name(property)));
+                } else if let Some(class_name) = name.strip_prefix("class.") {
+                    let class_name = syn::LitStr::new(class_name, Span::call_site()).to_token_stream().to_string();
+                    fields.push(format!("class: if {{ {value} }} {{ {class_name} }} else {{ \"\" }}"));
+                } else if let Some(style_name) = name.strip_prefix("style.") {
+                    let mut style_parts = style_name.splitn(2, '.');
+                    let property = style_parts.next().unwrap_or(style_name).replace('_', "-");
+                    let unit = style_parts.next().unwrap_or("");
+                    let style_template = format!("{property}: {{{{ {value} }}}}{unit};");
+                    fields.push(format!("style: {}", render_interpolated_string(&style_template)));
+                } else {
+                    fields.push(format!("{}: {{ {value} }}", render_attribute_name(name)));
+                }
+            }
+            AttributeKind::Event(event) => {
+                let value = required_value(attr)?.replace("$event", "__angular_event");
+                let parts = event.split('.').collect::<Vec<_>>();
+                let key_modifier = parts.iter().skip(1).find_map(|modifier| match *modifier {
+                    "enter" => Some("Enter"),
+                    "escape" | "esc" => Some("Escape"),
+                    "space" => Some(" "),
+                    "tab" => Some("Tab"),
+                    "delete" => Some("Delete"),
+                    "backspace" => Some("Backspace"),
+                    "arrowup" => Some("ArrowUp"),
+                    "arrowdown" => Some("ArrowDown"),
+                    "arrowleft" => Some("ArrowLeft"),
+                    "arrowright" => Some("ArrowRight"),
+                    _ => None,
+                });
+                let event_name = if key_modifier.is_some() { parts[0] } else { event.as_str() };
+                let handler = if let Some(key) = key_modifier {
+                    format!("if __angular_event.key() == {key:?} {{ {value}; }}")
+                } else {
+                    format!("{value};")
+                };
+                fields.push(format!(
+                    "{}: move |__angular_event| {{ {handler} }}",
+                    render_attribute_name(&format!("on{}", normalize_event_name(event_name)))
+                ));
+            }
+            AttributeKind::TwoWay(name) => {
+                let value = required_value(attr)?;
+                fields.push(format!("{}: {{ {value} }}", render_attribute_name(name)));
+                let (event, getter) = match name.as_str() {
+                    "value" => ("input", "value()"),
+                    "checked" => ("change", "checked()"),
+                    _ => ("change", "value()"),
+                };
+                fields.push(format!(
+                    "{}: move |__angular_event| {{ ({value}).set(__angular_event.{}); }}",
+                    render_attribute_name(&format!("on{event}")),
+                    getter
+                ));
+            }
+            AttributeKind::Reference(name) => fields.push(format!("node_ref: {{ {name} }}")),
+            AttributeKind::Generated(value) => fields.push(format!("{}: {value}", render_attribute_name(&attr.name))),
+        }
+    }
+    let children = render_nodes(&el.children)?;
+    if !children.is_empty() { fields.push(children); }
+    Ok(format!("{} {{ {} }}", el.name, fields.join(", ")))
+}
+
+fn required_value(attr: &Attribute) -> Result<String, String> {
+    attr.value.clone().filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Angular binding {} requires a value", attr.name))
+}
+
+fn render_attribute_name(name: &str) -> String {
+    if is_rust_ident(name) || name.contains(':') { name.to_owned() }
+    else { syn::LitStr::new(name, Span::call_site()).to_token_stream().to_string() }
+}
+
+fn render_interpolated_string(source: &str) -> String {
+    let mut formatted = String::new();
+    let mut pos = 0;
+    while pos < source.len() {
+        if source[pos..].starts_with("{{") {
+            if let Some(end) = find_interpolation_end(source, pos + 2) {
+                let expression = source[pos + 2..end].trim();
+                if expression.is_empty() {
+                    formatted.push_str("{{}}");
+                } else if expression.starts_with('{') || expression.ends_with('}') {
+                    formatted.push_str("{(");
+                    formatted.push_str(expression);
+                    formatted.push_str(")}");
+                } else {
+                    formatted.push('{');
+                    formatted.push_str(expression);
+                    formatted.push('}');
+                }
+                pos = end + 2;
+                continue;
+            }
+        }
+        let ch = source[pos..].chars().next().unwrap();
+        match ch {
+            '{' => formatted.push_str("{{"),
+            '}' => formatted.push_str("}}"),
+            _ => formatted.push(ch),
+        }
+        pos += ch.len_utf8();
+    }
+    syn::LitStr::new(&formatted, Span::call_site()).to_token_stream().to_string()
+}
+
+fn inject_track_keys(nodes: &mut [Node], track: &str) {
+    let multiple_roots = nodes.len() > 1;
+    for (index, node) in nodes.iter_mut().enumerate() {
+        let track_key = if multiple_roots {
+            format!("{track}:{index}")
+        } else {
+            track.to_owned()
+        };
+        match node {
+            Node::Element(el) => el.attrs.insert(0, Attribute {
+                name: "key".to_owned(),
+                value: None,
+                kind: AttributeKind::Generated(format!("\"{{{track_key}}}\"")),
+            }),
+            Node::If { branches, otherwise, .. } => {
+                for (_, body) in branches { inject_track_keys(body, &track_key); }
+                if let Some(body) = otherwise { inject_track_keys(body, &track_key); }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn loop_local_name(name: &str) -> Option<&'static str> {
+    match name {
+        "$index" => Some("__angular_index"),
+        "$count" => Some("__angular_count"),
+        "$first" => Some("__angular_first"),
+        "$last" => Some("__angular_last"),
+        "$even" => Some("__angular_even"),
+        "$odd" => Some("__angular_odd"),
+        _ => None,
+    }
+}
+
+fn rewrite_expression_loop_locals(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut pos = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while pos < source.len() {
+        let ch = source[pos..].chars().next().unwrap();
+        if let Some(delimiter) = quote {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            pos += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            output.push(ch);
+            pos += ch.len_utf8();
+            continue;
+        }
+        if ch == '$' {
+            let rest = &source[pos..];
+            let end = rest.char_indices().skip(1)
+                .take_while(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
+                .last()
+                .map(|(offset, next)| offset + next.len_utf8())
+                .unwrap_or(1);
+            let identifier = &rest[..end];
+            if let Some(replacement) = loop_local_name(identifier) {
+                output.push_str(replacement);
+            } else {
+                output.push_str(identifier);
+            }
+            pos += end;
+            continue;
+        }
+        output.push(ch);
+        pos += ch.len_utf8();
+    }
+    output
+}
+
+fn find_interpolation_end(source: &str, expression_start: usize) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut pos = expression_start;
+    let mut quote = None;
+    let mut escaped = false;
+    while pos < source.len() {
+        if let Some(delimiter) = quote {
+            let ch = source[pos..].chars().next()?;
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            pos += ch.len_utf8();
+            continue;
+        }
+        if pos + 1 < source.len() && source[pos..].starts_with("}}") && depth == 0 {
+            return Some(pos);
+        }
+        let ch = source[pos..].chars().next()?;
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        pos += ch.len_utf8();
+    }
+    None
+}
+
+fn rewrite_interpolations(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut pos = 0;
+    while pos < source.len() {
+        if source[pos..].starts_with("{{") {
+            if let Some(end) = find_interpolation_end(source, pos + 2) {
+                output.push_str("{{");
+                output.push_str(&rewrite_expression_loop_locals(&source[pos + 2..end]));
+                output.push_str("}}");
+                pos = end + 2;
+                continue;
+            }
+        }
+        let ch = source[pos..].chars().next().unwrap();
+        output.push(ch);
+        pos += ch.len_utf8();
+    }
+    output
+}
+
+fn rewrite_loop_locals(nodes: &mut [Node]) {
+    for node in nodes {
+        match node {
+            Node::Text(text) => *text = rewrite_interpolations(text),
+            Node::Element(element) => {
+                for attr in &mut element.attrs {
+                    match &mut attr.kind {
+                        AttributeKind::Static => {
+                            if let Some(value) = &mut attr.value {
+                                *value = rewrite_interpolations(value);
+                            }
+                        }
+                        AttributeKind::Property(_) | AttributeKind::Event(_) | AttributeKind::TwoWay(_) => {
+                            if let Some(value) = &mut attr.value {
+                                *value = rewrite_expression_loop_locals(value);
+                            }
+                        }
+                        AttributeKind::Reference(_) => {}
+                        AttributeKind::Generated(value) => *value = rewrite_expression_loop_locals(value),
+                    }
+                }
+                rewrite_loop_locals(&mut element.children);
+            }
+            Node::If { branches, otherwise, .. } => {
+                for (condition, body) in branches {
+                    *condition = rewrite_expression_loop_locals(condition);
+                    rewrite_loop_locals(body);
+                }
+                if let Some(body) = otherwise {
+                    rewrite_loop_locals(body);
+                }
+            }
+            Node::For { iterable, empty, .. } => {
+                *iterable = rewrite_expression_loop_locals(iterable);
+                if let Some(nodes) = empty {
+                    rewrite_loop_locals(nodes);
+                }
+            }
+            Node::Switch { expression, cases } => {
+                *expression = rewrite_expression_loop_locals(expression);
+                for (case, body) in cases {
+                    if let Some(case) = case {
+                        *case = rewrite_expression_loop_locals(case);
+                    }
+                    rewrite_loop_locals(body);
+                }
+            }
+            Node::Let { expression, .. } => *expression = rewrite_expression_loop_locals(expression),
+            Node::Defer { body, placeholder, loading, error } => {
+                rewrite_loop_locals(body);
+                if let Some(nodes) = placeholder { rewrite_loop_locals(nodes); }
+                if let Some(nodes) = loading { rewrite_loop_locals(nodes); }
+                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
+            }
+            Node::Boundary { body, error } => {
+                rewrite_loop_locals(body);
+                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
+            }
+        }
+    }
+}
+fn normalize_event_name(event: &str) -> String {
+    match event.trim() {
+        "double-click" => "dblclick".to_owned(),
+        "mouse-enter" => "mouseenter".to_owned(),
+        "mouse-leave" => "mouseleave".to_owned(),
+        "pointer-down" => "pointerdown".to_owned(),
+        "pointer-up" => "pointerup".to_owned(),
+        event => event.replace('-', "_"),
+    }
+}
+fn is_boolean_attribute(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(),
+        "allowfullscreen" | "async" | "autofocus" | "autoplay" | "checked" | "controls" |
+        "default" | "defer" | "disabled" | "formnovalidate" | "hidden" | "inert" |
+        "ismap" | "itemscope" | "loop" | "multiple" | "muted" | "nomodule" | "novalidate" |
+        "open" | "playsinline" | "readonly" | "required" | "reversed" | "selected")
+}
+
+fn is_void_element(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(),
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" |
+        "meta" | "param" | "source" | "track" | "wbr")
+}
+
+fn is_rust_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn split_once_word<'a>(source: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i + word.len() <= bytes.len() {
+        let ch = bytes[i] as char;
+        if let Some(q) = quote {
+            if ch == q && (i == 0 || bytes[i - 1] != b'\\') { quote = None; }
+            i += 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' { quote = Some(ch); i += 1; continue; }
+        if ch == '(' || ch == '[' || ch == '{' { depth += 1; }
+        else if ch == ')' || ch == ']' || ch == '}' { depth -= 1; }
+        else if depth == 0 && source[i..].starts_with(word) {
+            let before_ok = i == 0 || source[..i].chars().next_back().is_some_and(char::is_whitespace);
+            let after = i + word.len();
+            let after_ok = after == source.len() || source[after..].chars().next().is_some_and(char::is_whitespace);
+            if before_ok && after_ok { return Some((&source[..i], &source[after..])); }
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn split_once_top_level(source: &str, separator: char) -> Option<(&str, &str)> {
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in source.char_indices() {
+        if let Some(q) = quote {
+            if escaped { escaped = false; }
+            else if ch == '\\' { escaped = true; }
+            else if ch == q { quote = None; }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            c if c == separator && depth == 0 => return Some((&source[..index], &source[index + ch.len_utf8()..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level(source: &str, separator: char) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in source.char_indices() {
+        if let Some(q) = quote {
+            if escaped { escaped = false; }
+            else if ch == '\\' { escaped = true; }
+            else if ch == q { quote = None; }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            c if c == separator && depth == 0 => {
+                result.push(source[start..index].to_owned());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    result.push(source[start..].to_owned());
+    result
+}
+
+fn decode_html_entities(source: &str) -> String {
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < source.len() {
+        if source.as_bytes()[pos] == b'&' {
+            if let Some((entity, value)) = decode_entity_at_start(&source[pos..]) {
+                out.push_str(&value);
+                pos += entity.len();
+                continue;
+            }
+        }
+        let ch = source[pos..].chars().next().unwrap();
+        out.push(ch);
+        pos += ch.len_utf8();
+    }
+    out
+}
+
+fn decode_entity_at_start(source: &str) -> Option<(&str, String)> {
+    let end = source.find(';')?;
+    if end > 12 { return None; }
+    let entity = &source[..=end];
+    let name = &entity[1..end];
+    let value = match name {
+        "amp" => "&".to_owned(),
+        "lt" => "<".to_owned(),
+        "gt" => ">".to_owned(),
+        "quot" => "\"".to_owned(),
+        "apos" => "'".to_owned(),
+        "nbsp" => "\u{00a0}".to_owned(),
+        _ if name.starts_with("#x") || name.starts_with("#X") => char::from_u32(u32::from_str_radix(&name[2..], 16).ok()?)?.to_string(),
+        _ if name.starts_with('#') => char::from_u32(name[1..].parse().ok()?)?.to_string(),
+        _ => return None,
+    };
+    Some((entity, value))
+}
+
+pub(crate) fn expand(tokens: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(tokens as LitStr);
+    let source = input.value();
+    let parsed = match Parser::new(&source).parse() {
+        Ok(parsed) => parsed,
+        Err(message) => return Error::new(input.span(), message).to_compile_error().into(),
+    };
+    let rsx_source = match render_nodes(&parsed) {
+        Ok(source) => source,
+        Err(message) => return Error::new(input.span(), message).to_compile_error().into(),
+    };
+    match syn::parse_str::<rsx::CallBody>(&rsx_source) {
+        Ok(body) => body.into_token_stream().into(),
+        Err(error) => Error::new(input.span(), format!("failed to lower Angular template to Dioxus: {error}\nGenerated RSX: {rsx_source}"))
+            .to_compile_error().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lower(source: &str) -> String {
+        let nodes = Parser::new(source).parse().unwrap();
+        let generated = render_nodes(&nodes).unwrap();
+        syn::parse_str::<rsx::CallBody>(&generated)
+            .unwrap_or_else(|error| panic!("generated invalid RSX: {error}\\n{generated}"));
+        generated
+    }
+
+    #[test]
+    fn parses_html_elements_and_text() {
+        let rsx = lower(r#"<main class="app"><h1>Hello</h1><input disabled /></main>"#);
+        assert!(rsx.contains("main"));
+        assert!(rsx.contains("h1"));
+        assert!(rsx.contains("input"));
+        assert!(rsx.contains("disabled: true"));
+    }
+
+    #[test]
+    fn parses_interpolation_and_property_binding() {
+        let rsx = lower(r#"<button [disabled]="is_disabled">Hello {{ name }}</button>"#);
+        assert!(rsx.contains("disabled: { is_disabled }"));
+        assert!(rsx.contains("Hello {name}"));
+    }
+
+    #[test]
+    fn parses_events_and_two_way_binding() {
+        let rsx = lower(r#"<button (click)="save($event)">Save</button><input [(value)]="name" />"#);
+        assert!(rsx.contains("onclick"));
+        assert!(rsx.contains("oninput"));
+        assert!(rsx.contains("save(__angular_event)"));
+        assert!(rsx.contains("name).set"));
+    }
+
+    #[test]
+    fn parses_class_style_and_key_event_bindings() {
+        let rsx = lower(r#"<button [class.active]="active" [style.width.px]="width" (keydown.enter)="submit($event)">Go</button>"#);
+        assert!(rsx.contains("class: if"));
+        assert!(rsx.contains("width: {width}px"));
+        assert!(rsx.contains("onkeydown"));
+        assert!(rsx.contains("__angular_event.key()"));
+    }
+
+    #[test]
+    fn parses_if_else_and_for_empty() {
+        let rsx = lower(r#"@if (visible) { <p>Visible</p> } @else { <p>Hidden</p> }
+            @for (item of items; track item.id) { <p>{{ item.name }}</p> } @empty { <p>Empty</p> }"#);
+        assert!(rsx.contains("if visible"));
+        assert!(rsx.contains("for (__angular_index, item) in __angular_items.into_iter().enumerate()"));
+        assert!(rsx.contains("__angular_items.is_empty()"));
+        assert!(rsx.contains("key: \"{item.id}\""));
+    }
+
+    #[test]
+    fn supports_angular_loop_context_variables_and_aliases() {
+        let rsx = lower(
+            r#"@for (item of items; track item.id; let idx = $index, first = $first, total = $count) {
+                <p>{{ idx }} / {{ total }} {{ $even }} {{ item.name }}</p>
+            }"#,
+        );
+        assert!(rsx.contains("let idx = __angular_index"));
+        assert!(rsx.contains("let first = __angular_first"));
+        assert!(rsx.contains("let total = __angular_count"));
+        assert!(rsx.contains("{__angular_even}"));
+        assert!(rsx.contains("key: \"{item.id}\""));
+    }
+
+    #[test]
+    fn gives_multiple_roots_distinct_tracking_keys() {
+        let rsx = lower(
+            r#"@for (item of items; track item.id) {
+                <span>{{ item.name }}</span>
+                <small>{{ item.id }}</small>
+            }"#,
+        );
+        assert!(rsx.contains("key: \"{item.id}:0\""));
+        assert!(rsx.contains("key: \"{item.id}:1\""));
+    }
+
+    #[test]
+    fn interpolation_handles_nested_object_literals() {
+        let rsx = lower(r#"<p>{{ ({ nested: { value: 7 } }).nested.value }}</p>"#);
+        assert!(rsx.contains("({ nested: { value: 7 } }).nested.value"));
+    }
+
+    #[test]
+    fn parses_switch_and_let() {
+        let rsx = lower(r#"@let count = total; @switch (count) { @case (0) { <p>Zero</p> } @default { <p>Many</p> } }"#);
+        assert!(rsx.contains("let count = total"));
+        assert!(rsx.contains("__angular_switch_value"));
+        assert!(rsx.contains("if true"));
+    }
+
+    #[test]
+    fn parses_boundary_with_connected_error_block() {
+        let rsx = lower(r#"@boundary { <p>Content</p> } @error { <p>Failed</p> }"#);
+        assert!(rsx.contains("ErrorBoundary"));
+        assert!(rsx.contains("handle_error"));
+        assert!(rsx.contains("Failed"));
+    }
+
+    #[test]
+    fn parses_defer_triggers_with_whitespace() {
+        let rsx = lower(r#"@defer (on viewport) { <p>Lazy</p> } @placeholder (minimum 500ms) { <p>Wait</p> }"#);
+        assert!(rsx.contains("SuspenseBoundary"));
+        assert!(rsx.contains("Lazy"));
+        assert!(rsx.contains("Wait"));
+    }
+
+    #[test]
+    fn rejects_unterminated_interpolation() {
+        let error = Parser::new("<p>{{ value</p>").parse().unwrap_err();
+        assert!(error.contains("unterminated interpolation"));
+    }
+
+    #[test]
+    fn parses_if_option_alias() {
+        let rsx = lower(r#"@if (user; as user) { <p>{{ user.name }}</p> } @else { <p>Anonymous</p> }"#);
+        assert!(rsx.contains("if let Some(user) = (user)"));
+    }
+
+    #[test]
+    fn reports_mismatched_tags() {
+        let err = Parser::new("<div></span>").parse().unwrap_err();
+        assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn rewrites_loop_locals_outside_string_literals_only() {
+        assert_eq!(
+            rewrite_expression_loop_locals(r#""$index" + $index"#),
+            r#""$index" + __angular_index"#
+        );
+    }
+
+    #[test]
+    fn supports_unquoted_attribute_values_before_self_closing_tags() {
+        let rsx = lower(r#"<custom-widget data-mode=compact/>"#);
+        assert!(rsx.contains("data-mode"));
+        assert!(rsx.contains("compact"));
+    }
+
+    #[test]
+    fn decodes_entities() {
+        assert_eq!(decode_html_entities("a &amp; b &lt; c"), "a & b < c");
+    }
+}
+ {
+            let rest = &source[pos..];
+            let end = rest.char_indices().skip(1)
+                .take_while(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
+                .last()
+                .map(|(offset, next)| offset + next.len_utf8())
+                .unwrap_or(1);
+            let identifier = &rest[..end];
+            if let Some(replacement) = loop_local_name(identifier) {
+                output.push_str(replacement);
+            } else {
+                output.push_str(identifier);
+            }
+            pos += end;
+            continue;
+        }
+        output.push(ch);
+        pos += ch.len_utf8();
+    }
+    output
+}
