@@ -312,6 +312,7 @@ impl<'a> Parser<'a> {
 
     fn parse_defer(&mut self) -> Result<Node, String> {
         self.consume_control("defer")?;
+        self.skip_ws();
         let _triggers = if self.peek_char() == Some('(') { Some(self.read_parenthesized()?) } else { None };
         let body = self.parse_block()?;
         let mut placeholder = None;
