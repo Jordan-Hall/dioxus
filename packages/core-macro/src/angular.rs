@@ -929,7 +929,144 @@ fn rewrite_expression_loop_locals(source: &str) -> String {
             pos += ch.len_utf8();
             continue;
         }
-        if ch == '
+        if ch == '$' {
+ {
+            let rest = &source[pos..];
+            let end = rest.char_indices().skip(1)
+                .take_while(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
+                .last()
+                .map(|(offset, next)| offset + next.len_utf8())
+                .unwrap_or(1);
+            let identifier = &rest[..end];
+            if let Some(replacement) = loop_local_name(identifier) {
+                output.push_str(replacement);
+            } else {
+                output.push_str(identifier);
+            }
+            pos += end;
+            continue;
+        }
+        output.push(ch);
+        pos += ch.len_utf8();
+    }
+    output
+}
+
+fn find_interpolation_end(source: &str, expression_start: usize) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut pos = expression_start;
+    let mut quote = None;
+    let mut escaped = false;
+    while pos < source.len() {
+        if let Some(delimiter) = quote {
+            let ch = source[pos..].chars().next()?;
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            pos += ch.len_utf8();
+            continue;
+        }
+        if pos + 1 < source.len() && source[pos..].starts_with("}}") && depth == 0 {
+            return Some(pos);
+        }
+        let ch = source[pos..].chars().next()?;
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        pos += ch.len_utf8();
+    }
+    None
+}
+
+fn rewrite_interpolations(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut pos = 0;
+    while pos < source.len() {
+        if source[pos..].starts_with("{{") {
+            if let Some(end) = find_interpolation_end(source, pos + 2) {
+                output.push_str("{{");
+                output.push_str(&rewrite_expression_loop_locals(&source[pos + 2..end]));
+                output.push_str("}}");
+                pos = end + 2;
+                continue;
+            }
+        }
+        let ch = source[pos..].chars().next().unwrap();
+        output.push(ch);
+        pos += ch.len_utf8();
+    }
+    output
+}
+
+fn rewrite_loop_locals(nodes: &mut [Node]) {
+    for node in nodes {
+        match node {
+            Node::Text(text) => *text = rewrite_interpolations(text),
+            Node::Element(element) => {
+                for attr in &mut element.attrs {
+                    match &mut attr.kind {
+                        AttributeKind::Static => {
+                            if let Some(value) = &mut attr.value {
+                                *value = rewrite_interpolations(value);
+                            }
+                        }
+                        AttributeKind::Property(_) | AttributeKind::Event(_) | AttributeKind::TwoWay(_) => {
+                            if let Some(value) = &mut attr.value {
+                                *value = rewrite_expression_loop_locals(value);
+                            }
+                        }
+                        AttributeKind::Reference(_) => {}
+                        AttributeKind::Generated(value) => *value = rewrite_expression_loop_locals(value),
+                    }
+                }
+                rewrite_loop_locals(&mut element.children);
+            }
+            Node::If { branches, otherwise, .. } => {
+                for (condition, body) in branches {
+                    *condition = rewrite_expression_loop_locals(condition);
+                    rewrite_loop_locals(body);
+                }
+                if let Some(body) = otherwise {
+                    rewrite_loop_locals(body);
+                }
+            }
+            Node::For { iterable, empty, .. } => {
+                *iterable = rewrite_expression_loop_locals(iterable);
+                if let Some(nodes) = empty {
+                    rewrite_loop_locals(nodes);
+                }
+            }
+            Node::Switch { expression, cases } => {
+                *expression = rewrite_expression_loop_locals(expression);
+                for (case, body) in cases {
+                    if let Some(case) = case {
+                        *case = rewrite_expression_loop_locals(case);
+                    }
+                    rewrite_loop_locals(body);
+                }
+            }
+            Node::Let { expression, .. } => *expression = rewrite_expression_loop_locals(expression),
+            Node::Defer { body, placeholder, loading, error } => {
+                rewrite_loop_locals(body);
+                if let Some(nodes) = placeholder { rewrite_loop_locals(nodes); }
+                if let Some(nodes) = loading { rewrite_loop_locals(nodes); }
+                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
+            }
+            Node::Boundary { body, error } => {
+                rewrite_loop_locals(body);
+                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
+            }
+        }
+    }
+}
+fn normalize_event_name(event: &str) -> String {
     match event.trim() {
         "double-click" => "dblclick".to_owned(),
         "mouse-enter" => "mouseenter".to_owned(),
@@ -939,7 +1076,6 @@ fn rewrite_expression_loop_locals(source: &str) -> String {
         event => event.replace('-', "_"),
     }
 }
-
 fn is_boolean_attribute(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(),
         "allowfullscreen" | "async" | "autofocus" | "autoplay" | "checked" | "controls" |
@@ -1165,394 +1301,6 @@ mod tests {
     fn interpolation_handles_nested_object_literals() {
         let rsx = lower(r#"<p>{{ ({ nested: { value: 7 } }).nested.value }}</p>"#);
         assert!(rsx.contains("({ nested: { value: 7 } }).nested.value"));
-    }
-
-    #[test]
-    fn parses_switch_and_let() {
-        let rsx = lower(r#"@let count = total; @switch (count) { @case (0) { <p>Zero</p> } @default { <p>Many</p> } }"#);
-        assert!(rsx.contains("let count = total"));
-        assert!(rsx.contains("__angular_switch_value"));
-        assert!(rsx.contains("if true"));
-    }
-
-    #[test]
-    fn parses_boundary_with_connected_error_block() {
-        let rsx = lower(r#"@boundary { <p>Content</p> } @error { <p>Failed</p> }"#);
-        assert!(rsx.contains("ErrorBoundary"));
-        assert!(rsx.contains("handle_error"));
-        assert!(rsx.contains("Failed"));
-    }
-
-    #[test]
-    fn parses_if_option_alias() {
-        let rsx = lower(r#"@if (user; as user) { <p>{{ user.name }}</p> } @else { <p>Anonymous</p> }"#);
-        assert!(rsx.contains("if let Some(user) = (user)"));
-    }
-
-    #[test]
-    fn reports_mismatched_tags() {
-        let err = Parser::new("<div></span>").parse().unwrap_err();
-        assert!(err.contains("does not match"));
-    }
-
-    #[test]
-    fn decodes_entities() {
-        assert_eq!(decode_html_entities("a &amp; b &lt; c"), "a & b < c");
-    }
-}
- {
-            let rest = &source[pos..];
-            let end = rest.char_indices().skip(1)
-                .take_while(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
-                .last()
-                .map(|(offset, next)| offset + next.len_utf8())
-                .unwrap_or(1);
-            let identifier = &rest[..end];
-            if let Some(replacement) = loop_local_name(identifier) {
-                output.push_str(replacement);
-            } else {
-                output.push_str(identifier);
-            }
-            pos += end;
-            continue;
-        }
-        output.push(ch);
-        pos += ch.len_utf8();
-    }
-    output
-}
-
-fn find_interpolation_end(source: &str, expression_start: usize) -> Option<usize> {
-    let mut depth = 0_i32;
-    let mut pos = expression_start;
-    let mut quote = None;
-    let mut escaped = false;
-    while pos < source.len() {
-        if let Some(delimiter) = quote {
-            let ch = source[pos..].chars().next()?;
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == delimiter {
-                quote = None;
-            }
-            pos += ch.len_utf8();
-            continue;
-        }
-        if pos + 1 < source.len() && source[pos..].starts_with("}}") && depth == 0 {
-            return Some(pos);
-        }
-        let ch = source[pos..].chars().next()?;
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '{' => depth += 1,
-            '}' if depth > 0 => depth -= 1,
-            _ => {}
-        }
-        pos += ch.len_utf8();
-    }
-    None
-}
-
-fn rewrite_interpolations(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut pos = 0;
-    while pos < source.len() {
-        if source[pos..].starts_with("{{") {
-            if let Some(end) = find_interpolation_end(source, pos + 2) {
-                output.push_str("{{");
-                output.push_str(&rewrite_expression_loop_locals(&source[pos + 2..end]));
-                output.push_str("}}");
-                pos = end + 2;
-                continue;
-            }
-        }
-        let ch = source[pos..].chars().next().unwrap();
-        output.push(ch);
-        pos += ch.len_utf8();
-    }
-    output
-}
-
-fn rewrite_loop_locals(nodes: &mut [Node]) {
-    for node in nodes {
-        match node {
-            Node::Text(text) => *text = rewrite_interpolations(text),
-            Node::Element(element) => {
-                for attr in &mut element.attrs {
-                    match &mut attr.kind {
-                        AttributeKind::Static => {
-                            if let Some(value) = &mut attr.value {
-                                *value = rewrite_interpolations(value);
-                            }
-                        }
-                        AttributeKind::Property(_) | AttributeKind::Event(_) | AttributeKind::TwoWay(_) => {
-                            if let Some(value) = &mut attr.value {
-                                *value = rewrite_expression_loop_locals(value);
-                            }
-                        }
-                        AttributeKind::Reference(_) => {}
-                        AttributeKind::Generated(value) => *value = rewrite_expression_loop_locals(value),
-                    }
-                }
-                rewrite_loop_locals(&mut element.children);
-            }
-            Node::If { branches, otherwise, .. } => {
-                for (condition, body) in branches {
-                    *condition = rewrite_expression_loop_locals(condition);
-                    rewrite_loop_locals(body);
-                }
-                if let Some(body) = otherwise {
-                    rewrite_loop_locals(body);
-                }
-            }
-            Node::For { iterable, empty, .. } => {
-                *iterable = rewrite_expression_loop_locals(iterable);
-                if let Some(nodes) = empty {
-                    rewrite_loop_locals(nodes);
-                }
-            }
-            Node::Switch { expression, cases } => {
-                *expression = rewrite_expression_loop_locals(expression);
-                for (case, body) in cases {
-                    if let Some(case) = case {
-                        *case = rewrite_expression_loop_locals(case);
-                    }
-                    rewrite_loop_locals(body);
-                }
-            }
-            Node::Let { expression, .. } => *expression = rewrite_expression_loop_locals(expression),
-            Node::Defer { body, placeholder, loading, error } => {
-                rewrite_loop_locals(body);
-                if let Some(nodes) = placeholder { rewrite_loop_locals(nodes); }
-                if let Some(nodes) = loading { rewrite_loop_locals(nodes); }
-                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
-            }
-            Node::Boundary { body, error } => {
-                rewrite_loop_locals(body);
-                if let Some(nodes) = error { rewrite_loop_locals(nodes); }
-            }
-        }
-    }
-}
-
-fn normalize_event_name(event: &str) -> String {
-    match event.trim() {
-        "double-click" => "dblclick".to_owned(),
-        "mouse-enter" => "mouseenter".to_owned(),
-        "mouse-leave" => "mouseleave".to_owned(),
-        "pointer-down" => "pointerdown".to_owned(),
-        "pointer-up" => "pointerup".to_owned(),
-        event => event.replace('-', "_"),
-    }
-}
-
-fn is_boolean_attribute(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(),
-        "allowfullscreen" | "async" | "autofocus" | "autoplay" | "checked" | "controls" |
-        "default" | "defer" | "disabled" | "formnovalidate" | "hidden" | "inert" |
-        "ismap" | "itemscope" | "loop" | "multiple" | "muted" | "nomodule" | "novalidate" |
-        "open" | "playsinline" | "readonly" | "required" | "reversed" | "selected")
-}
-
-fn is_void_element(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(),
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" |
-        "meta" | "param" | "source" | "track" | "wbr")
-}
-
-fn is_rust_ident(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn split_once_word<'a>(source: &'a str, word: &str) -> Option<(&'a str, &'a str)> {
-    let mut depth = 0_i32;
-    let mut quote = None;
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while i + word.len() <= bytes.len() {
-        let ch = bytes[i] as char;
-        if let Some(q) = quote {
-            if ch == q && (i == 0 || bytes[i - 1] != b'\\') { quote = None; }
-            i += 1;
-            continue;
-        }
-        if ch == '"' || ch == '\'' { quote = Some(ch); i += 1; continue; }
-        if ch == '(' || ch == '[' || ch == '{' { depth += 1; }
-        else if ch == ')' || ch == ']' || ch == '}' { depth -= 1; }
-        else if depth == 0 && source[i..].starts_with(word) {
-            let before_ok = i == 0 || source[..i].chars().next_back().is_some_and(char::is_whitespace);
-            let after = i + word.len();
-            let after_ok = after == source.len() || source[after..].chars().next().is_some_and(char::is_whitespace);
-            if before_ok && after_ok { return Some((&source[..i], &source[after..])); }
-        }
-        i += ch.len_utf8();
-    }
-    None
-}
-
-fn split_once_top_level(source: &str, separator: char) -> Option<(&str, &str)> {
-    let mut depth = 0_i32;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if let Some(q) = quote {
-            if escaped { escaped = false; }
-            else if ch == '\\' { escaped = true; }
-            else if ch == q { quote = None; }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            c if c == separator && depth == 0 => return Some((&source[..index], &source[index + ch.len_utf8()..])),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level(source: &str, separator: char) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    let mut depth = 0_i32;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if let Some(q) = quote {
-            if escaped { escaped = false; }
-            else if ch == '\\' { escaped = true; }
-            else if ch == q { quote = None; }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            c if c == separator && depth == 0 => {
-                result.push(source[start..index].to_owned());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    result.push(source[start..].to_owned());
-    result
-}
-
-fn decode_html_entities(source: &str) -> String {
-    let mut out = String::new();
-    let mut pos = 0;
-    while pos < source.len() {
-        if source.as_bytes()[pos] == b'&' {
-            if let Some((entity, value)) = decode_entity_at_start(&source[pos..]) {
-                out.push_str(&value);
-                pos += entity.len();
-                continue;
-            }
-        }
-        let ch = source[pos..].chars().next().unwrap();
-        out.push(ch);
-        pos += ch.len_utf8();
-    }
-    out
-}
-
-fn decode_entity_at_start(source: &str) -> Option<(&str, String)> {
-    let end = source.find(';')?;
-    if end > 12 { return None; }
-    let entity = &source[..=end];
-    let name = &entity[1..end];
-    let value = match name {
-        "amp" => "&".to_owned(),
-        "lt" => "<".to_owned(),
-        "gt" => ">".to_owned(),
-        "quot" => "\"".to_owned(),
-        "apos" => "'".to_owned(),
-        "nbsp" => "\u{00a0}".to_owned(),
-        _ if name.starts_with("#x") || name.starts_with("#X") => char::from_u32(u32::from_str_radix(&name[2..], 16).ok()?)?.to_string(),
-        _ if name.starts_with('#') => char::from_u32(name[1..].parse().ok()?)?.to_string(),
-        _ => return None,
-    };
-    Some((entity, value))
-}
-
-pub(crate) fn expand(tokens: TokenStream) -> TokenStream {
-    let input = syn::parse_macro_input!(tokens as LitStr);
-    let source = input.value();
-    let parsed = match Parser::new(&source).parse() {
-        Ok(parsed) => parsed,
-        Err(message) => return Error::new(input.span(), message).to_compile_error().into(),
-    };
-    let rsx_source = match render_nodes(&parsed) {
-        Ok(source) => source,
-        Err(message) => return Error::new(input.span(), message).to_compile_error().into(),
-    };
-    match syn::parse_str::<rsx::CallBody>(&rsx_source) {
-        Ok(body) => body.into_token_stream().into(),
-        Err(error) => Error::new(input.span(), format!("failed to lower Angular template to Dioxus: {error}\nGenerated RSX: {rsx_source}"))
-            .to_compile_error().into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lower(source: &str) -> String {
-        let nodes = Parser::new(source).parse().unwrap();
-        let generated = render_nodes(&nodes).unwrap();
-        syn::parse_str::<rsx::CallBody>(&generated)
-            .unwrap_or_else(|error| panic!("generated invalid RSX: {error}\\n{generated}"));
-        generated
-    }
-
-    #[test]
-    fn parses_html_elements_and_text() {
-        let rsx = lower(r#"<main class="app"><h1>Hello</h1><input disabled /></main>"#);
-        assert!(rsx.contains("main"));
-        assert!(rsx.contains("h1"));
-        assert!(rsx.contains("input"));
-        assert!(rsx.contains("disabled: true"));
-    }
-
-    #[test]
-    fn parses_interpolation_and_property_binding() {
-        let rsx = lower(r#"<button [disabled]="is_disabled">Hello {{ name }}</button>"#);
-        assert!(rsx.contains("disabled: { is_disabled }"));
-        assert!(rsx.contains("Hello {name}"));
-    }
-
-    #[test]
-    fn parses_events_and_two_way_binding() {
-        let rsx = lower(r#"<button (click)="save($event)">Save</button><input [(value)]="name" />"#);
-        assert!(rsx.contains("onclick"));
-        assert!(rsx.contains("oninput"));
-        assert!(rsx.contains("save(__angular_event)"));
-        assert!(rsx.contains("name).set"));
-    }
-
-    #[test]
-    fn parses_class_style_and_key_event_bindings() {
-        let rsx = lower(r#"<button [class.active]="active" [style.width.px]="width" (keydown.enter)="submit($event)">Go</button>"#);
-        assert!(rsx.contains("class: if"));
-        assert!(rsx.contains("width: {width}px"));
-        assert!(rsx.contains("onkeydown"));
-        assert!(rsx.contains("__angular_event.key()"));
-    }
-
-    #[test]
-    fn parses_if_else_and_for_empty() {
-        let rsx = lower(r#"@if (visible) { <p>Visible</p> } @else { <p>Hidden</p> }
-            @for (item of items; track item.id) { <p>{{ item.name }}</p> } @empty { <p>Empty</p> }"#);
-        assert!(rsx.contains("if visible"));
-        assert!(rsx.contains("for item in __angular_items"));
-        assert!(rsx.contains("__angular_items.is_empty()"));
-        assert!(rsx.contains("key"));
     }
 
     #[test]
