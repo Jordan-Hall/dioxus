@@ -881,7 +881,7 @@ fn inject_track_keys(nodes: &mut [Node], track: &str) {
             Node::Element(el) => el.attrs.insert(0, Attribute {
                 name: "key".to_owned(),
                 value: None,
-                kind: AttributeKind::Generated(format!("{{{track}}}")),
+                kind: AttributeKind::Generated(format!("\"{{{track}}}\"")),
             }),
             Node::If { branches, otherwise, .. } => {
                 for (_, body) in branches { inject_track_keys(body, track); }
@@ -1279,7 +1279,7 @@ mod tests {
         assert!(rsx.contains("if visible"));
         assert!(rsx.contains("for (__angular_index, item) in __angular_items.into_iter().enumerate()"));
         assert!(rsx.contains("__angular_items.is_empty()"));
-        assert!(rsx.contains("key: {item.id}"));
+        assert!(rsx.contains("key: \"{item.id}\""));
     }
 
     #[test]
