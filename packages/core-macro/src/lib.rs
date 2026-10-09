@@ -7,6 +7,7 @@ use proc_macro::TokenStream;
 use quote::ToTokens;
 use syn::parse_macro_input;
 
+mod angular;
 mod component;
 mod props;
 mod utils;
@@ -30,6 +31,12 @@ pub fn rsx(tokens: TokenStream) -> TokenStream {
         Err(err) => err.to_compile_error().into(),
         Ok(body) => body.into_token_stream().into(),
     }
+}
+
+#[doc = include_str!("../docs/angular.md")]
+#[proc_macro]
+pub fn angular(tokens: TokenStream) -> TokenStream {
+    angular::expand(tokens)
 }
 
 #[doc = include_str!("../docs/component.md")]
