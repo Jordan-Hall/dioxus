@@ -1142,9 +1142,29 @@ mod tests {
         let rsx = lower(r#"@if (visible) { <p>Visible</p> } @else { <p>Hidden</p> }
             @for (item of items; track item.id) { <p>{{ item.name }}</p> } @empty { <p>Empty</p> }"#);
         assert!(rsx.contains("if visible"));
-        assert!(rsx.contains("for item in __angular_items"));
+        assert!(rsx.contains("for (__angular_index, item) in __angular_items.into_iter().enumerate()"));
         assert!(rsx.contains("__angular_items.is_empty()"));
-        assert!(rsx.contains("key"));
+        assert!(rsx.contains("key: {item.id}"));
+    }
+
+    #[test]
+    fn supports_angular_loop_context_variables_and_aliases() {
+        let rsx = lower(
+            r#"@for (item of items; track item.id; let idx = $index, first = $first, total = $count) {
+                <p>{{ idx }} / {{ total }} {{ $even }} {{ item.name }}</p>
+            }"#,
+        );
+        assert!(rsx.contains("let idx = __angular_index"));
+        assert!(rsx.contains("let first = __angular_first"));
+        assert!(rsx.contains("let total = __angular_count"));
+        assert!(rsx.contains("{__angular_even}"));
+        assert!(rsx.contains("key: {item.id}"));
+    }
+
+    #[test]
+    fn interpolation_handles_nested_object_literals() {
+        let rsx = lower(r#"<p>{{ ({ nested: { value: 7 } }).nested.value }}</p>"#);
+        assert!(rsx.contains("({ nested: { value: 7 } }).nested.value"));
     }
 
     #[test]
