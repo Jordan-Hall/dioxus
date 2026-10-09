@@ -934,7 +934,10 @@ mod tests {
 
     fn lower(source: &str) -> String {
         let nodes = Parser::new(source).parse().unwrap();
-        render_nodes(&nodes).unwrap()
+        let generated = render_nodes(&nodes).unwrap();
+        syn::parse_str::<rsx::CallBody>(&generated)
+            .unwrap_or_else(|error| panic!("generated invalid RSX: {error}\\n{generated}"));
+        generated
     }
 
     #[test]
@@ -955,7 +958,8 @@ mod tests {
 
     #[test]
     fn parses_events_and_two_way_binding() {
-        let rsx = lower(r#"<input (input)="save($event)" [(value)]="name" />"#);
+        let rsx = lower(r#"<button (click)="save($event)">Save</button><input [(value)]="name" />"#);
+        assert!(rsx.contains("onclick"));
         assert!(rsx.contains("oninput"));
         assert!(rsx.contains("save(__angular_event)"));
         assert!(rsx.contains("name).set"));
