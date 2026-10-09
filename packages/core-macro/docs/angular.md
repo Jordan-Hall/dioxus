@@ -34,7 +34,8 @@ The angular! procedural macro accepts one Rust string literal containing an Angu
 - Property bindings such as [disabled]="condition" and bind-disabled="condition".
 - Event bindings such as (click)="handler($event)" and on-click="handler($event)". $event is translated to the generated Rust closure argument.
 - Two-way binding syntax such as [(value)]="signal" and bindon-value="signal". The current adapter uses Dioxus form events for value and checked.
-- @if / @else if / @else (including Option aliases using @if (option; as value)), @for (item of items; track item.id) / @empty (including `$index`, `$count`, `$first`, `$last`, `$even`, `$odd` and `let alias = $index` context aliases), @switch / @case / @default, and @let name = rust_expression;.
+- @if / @else if / @else (including Option aliases using `@if (option; as value)`), `@for (item of items; track item.id)` / `@empty` (including `$index`, `$count`, `$first`, `$last`, `$even`, `$odd` and `let alias = $index` aliases), `@switch` / `@case` / `@default`, and `@let name = rust_expression;`.
+- Each `@for` root element receives a key derived from the `track` expression. Multi-root loop bodies receive a root-index suffix to prevent sibling keys from colliding.
 - @boundary with an optional @error block, lowered to Dioxus's ErrorBoundary.
 - @defer with @placeholder, @loading, and @error blocks, lowered to Dioxus suspense/error boundaries.
 
