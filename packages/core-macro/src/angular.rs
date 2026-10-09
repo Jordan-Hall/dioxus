@@ -736,7 +736,7 @@ fn render_node(node: &Node) -> Result<String, String> {
             let body = render_nodes(body)?;
             if let Some(error_nodes) = error {
                 Ok(format!(
-                    "ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }} }}",
+                    "::dioxus::prelude::ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, ::dioxus::prelude::SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }} }}",
                     render_nodes(error_nodes)?
                 ))
             } else {
