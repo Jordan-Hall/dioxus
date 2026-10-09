@@ -24,6 +24,7 @@
 `dioxus-core-macro` provides a handful of helpful macros used by the `dioxus` crate. These include:
 
 - The `rsx!` macro that underpins templates and node creation.
+- The `angular!` macro, which accepts Angular-style HTML templates and lowers them through the RSX parser and code generator. See [the Angular template guide](docs/angular.md) for supported syntax and semantic limits.
 - The `component` attribute macro denotes a function as a Dioxus component. Currently, this:
   - Transforms function arguments into an auto-derived struct.
   - Ensures that your component name uses PascalCase.
