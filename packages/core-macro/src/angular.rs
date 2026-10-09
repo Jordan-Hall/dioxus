@@ -1293,7 +1293,7 @@ mod tests {
         assert!(rsx.contains("let first = __angular_first"));
         assert!(rsx.contains("let total = __angular_count"));
         assert!(rsx.contains("{__angular_even}"));
-        assert!(rsx.contains("key: {item.id}"));
+        assert!(rsx.contains("key: \"{item.id}\""));
     }
 
     #[test]
