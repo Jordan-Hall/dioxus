@@ -472,7 +472,7 @@ impl<'a> Parser<'a> {
         }
         let start = self.pos;
         while let Some(ch) = self.peek_char() {
-            if ch.is_whitespace() || ch == '>' { break; }
+            if ch.is_whitespace() || ch == '>' || (ch == '/' && self.starts_with("/>")) { break; }
             self.bump_char();
         }
         Ok(decode_html_entities(&self.source[start..self.pos]))
@@ -1328,6 +1328,21 @@ mod tests {
     fn reports_mismatched_tags() {
         let err = Parser::new("<div></span>").parse().unwrap_err();
         assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn rewrites_loop_locals_outside_string_literals_only() {
+        assert_eq!(
+            rewrite_expression_loop_locals(r#""$index" + $index"#),
+            r#""$index" + __angular_index"#
+        );
+    }
+
+    #[test]
+    fn supports_unquoted_attribute_values_before_self_closing_tags() {
+        let rsx = lower(r#"<custom-widget data-mode=compact/>"#);
+        assert!(rsx.contains("data-mode"));
+        assert!(rsx.contains("compact"));
     }
 
     #[test]
