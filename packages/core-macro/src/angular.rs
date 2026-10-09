@@ -9,7 +9,7 @@ use crate::rsx;
 enum Node {
     Text(String),
     Element(Element),
-    If { branches: Vec<(String, Vec<Node>)>, otherwise: Option<Vec<Node>> },
+    If { branches: Vec<(String, Vec<Node>)>, otherwise: Option<Vec<Node>>, alias: Option<String> },
     For { pattern: String, iterable: String, track: Option<String>, body: Vec<Node>, empty: Option<Vec<Node>> },
     Switch { expression: String, cases: Vec<(Option<String>, Vec<Node>)> },
     Let { name: String, expression: String },
@@ -128,12 +128,16 @@ impl<'a> Parser<'a> {
     fn parse_if(&mut self) -> Result<Node, String> {
         self.consume_control("if")?;
         let header = self.read_parenthesized()?;
-        let (condition, suffix) = split_once_top_level(&header, ';')
-            .map(|(condition, rest)| (condition.trim().to_owned(), Some(rest.trim().to_owned())))
+        let (condition, alias) = split_once_top_level(&header, ';')
+            .map(|(condition, rest)| {
+                let suffix = rest.trim();
+                let alias = suffix.strip_prefix("as ").map(str::trim).map(str::to_owned);
+                (condition.trim().to_owned(), alias)
+            })
             .unwrap_or((header.trim().to_owned(), None));
-        if let Some(suffix) = suffix {
-            if !suffix.is_empty() {
-                return self.error("Angular @if aliases require a Rust binding and are not yet supported; move the binding to @let");
+        if let Some(alias) = alias.as_deref() {
+            if !is_rust_ident(alias) {
+                return self.error("@if alias must be a Rust identifier");
             }
         }
         if condition.is_empty() {
@@ -161,7 +165,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Node::If { branches, otherwise })
+        Ok(Node::If { branches, otherwise, alias })
     }
 
     fn parse_for(&mut self) -> Result<Node, String> {
@@ -614,11 +618,19 @@ fn render_node(node: &Node) -> Result<String, String> {
     match node {
         Node::Text(text) => Ok(render_interpolated_string(&decode_html_entities(text))),
         Node::Element(el) => render_element(el),
-        Node::If { branches, otherwise } => {
+        Node::If { branches, otherwise, alias } => {
             let mut out = String::new();
             for (index, (condition, body)) in branches.iter().enumerate() {
                 if index > 0 { out.push_str(" else "); }
-                out.push_str(&format!("if {condition} {{ {} }}", render_nodes(body)?));
+                if index == 0 {
+                    if let Some(alias) = alias {
+                        out.push_str(&format!("if let Some({alias}) = ({condition}) {{ {} }}", render_nodes(body)?));
+                    } else {
+                        out.push_str(&format!("if {condition} {{ {} }}", render_nodes(body)?));
+                    }
+                } else {
+                    out.push_str(&format!("if {condition} {{ {} }}", render_nodes(body)?));
+                }
             }
             if let Some(body) = otherwise { out.push_str(&format!(" else {{ {} }}", render_nodes(body)?)); }
             Ok(out)
@@ -766,7 +778,7 @@ fn inject_track_keys(nodes: &mut [Node], track: &str) {
                 value: None,
                 kind: AttributeKind::Generated(format!("\"{{{track}}}\"")),
             }),
-            Node::If { branches, otherwise } => {
+            Node::If { branches, otherwise, .. } => {
                 for (_, body) in branches { inject_track_keys(body, track); }
                 if let Some(body) = otherwise { inject_track_keys(body, track); }
             }
