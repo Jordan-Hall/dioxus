@@ -34,7 +34,7 @@ The angular! procedural macro accepts one Rust string literal containing an Angu
 - Property bindings such as [disabled]="condition" and bind-disabled="condition".
 - Event bindings such as (click)="handler($event)" and on-click="handler($event)". $event is translated to the generated Rust closure argument.
 - Two-way binding syntax such as [(value)]="signal" and bindon-value="signal". The current adapter uses Dioxus form events for value and checked.
-- @if / @else if / @else (including Option aliases using @if (option; as value)), @for (item of items; track item.id) / @empty, @switch / @case / @default, and @let name = rust_expression;.
+- @if / @else if / @else (including Option aliases using @if (option; as value)), @for (item of items; track item.id) / @empty (including `$index`, `$count`, `$first`, `$last`, `$even`, `$odd` and `let alias = $index` context aliases), @switch / @case / @default, and @let name = rust_expression;.
 - @boundary with an optional @error block, lowered to Dioxus's ErrorBoundary.
 - @defer with @placeholder, @loading, and @error blocks, lowered to Dioxus suspense/error boundaries.
 
@@ -47,7 +47,10 @@ This macro is a syntax frontend, not a port of Angular's complete compiler or ru
 - @defer currently selects a Dioxus suspense fallback but does not implement Angular's idle/viewport/interaction/timer trigger scheduling or automatic JavaScript chunk splitting. Trigger clauses are parsed for forward compatibility but do not change runtime behavior.
 - Angular @if (...; as alias) is mapped to Rust Option matching: the condition must evaluate to Option<T>.
 - #templateRef / ref-name declarations do not have Angular's template variable semantics; declare a Dioxus NodeRef in Rust and use the same identifier in the template.
-- Angular directives, pipes, dependency injection, JavaScript truthiness, signal-specific TypeScript unwrapping, and Angular input/output metadata are not synthesized. Components must be ordinary Dioxus components with Rust props/events.
 - Angular's $index, $first, $last, $even, $odd, and $count loop locals are not injected. Use Rust iterator expressions and explicit item bindings.
 
 Unsupported or invalid template syntax produces a compile error at the macro call site. The resulting Dioxus nodes go through the established RSX code-generation path instead of creating a parallel renderer.
+
+## Relationship to Angular PR #71259
+
+Angular PR [#71259](https://github.com/angular/angular/pull/71259) integrates a hybrid compiler preprocessor and the Rust/OXC TypeScript semantic analyzer into `compiler-cli`, plus language-service and Wasm/N-API integration. That Rust analyzer understands TypeScript programs and their cross-file semantics; it is not an Angular-template parser or a Rust expression compiler. This macro therefore reuses the relevant compiler architecture (parse, validate, lower, then delegate to an established backend) without embedding OXC or pretending to evaluate TypeScript in Rust.
