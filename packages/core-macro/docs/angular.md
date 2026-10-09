@@ -47,7 +47,7 @@ This macro is a syntax frontend, not a port of Angular's complete compiler or ru
 - @defer currently selects a Dioxus suspense fallback but does not implement Angular's idle/viewport/interaction/timer trigger scheduling or automatic JavaScript chunk splitting. Trigger clauses are parsed for forward compatibility but do not change runtime behavior.
 - Angular @if (...; as alias) is mapped to Rust Option matching: the condition must evaluate to Option<T>.
 - #templateRef / ref-name declarations do not have Angular's template variable semantics; declare a Dioxus NodeRef in Rust and use the same identifier in the template.
-- Angular's $index, $first, $last, $even, $odd, and $count loop locals are not injected. Use Rust iterator expressions and explicit item bindings.
+- `@for` is materialized into a `Vec` so `$count`, `$index`, `$first`, `$last`, `$even`, and `$odd` are available. This simplifies correct empty checks and alias values, at the cost of one collection allocation per render.
 
 Unsupported or invalid template syntax produces a compile error at the macro call site. The resulting Dioxus nodes go through the established RSX code-generation path instead of creating a parallel renderer.
 
