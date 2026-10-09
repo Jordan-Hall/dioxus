@@ -34,7 +34,7 @@ The angular! procedural macro accepts one Rust string literal containing an Angu
 - Property bindings such as [disabled]="condition" and bind-disabled="condition".
 - Event bindings such as (click)="handler($event)" and on-click="handler($event)". $event is translated to the generated Rust closure argument.
 - Two-way binding syntax such as [(value)]="signal" and bindon-value="signal". The current adapter uses Dioxus form events for value and checked.
-- @if / @else if / @else, @for (item of items; track item.id) / @empty, @switch / @case / @default, and @let name = rust_expression;.
+- @if / @else if / @else (including Option aliases using @if (option; as value)), @for (item of items; track item.id) / @empty, @switch / @case / @default, and @let name = rust_expression;.
 - @boundary with an optional @error block, lowered to Dioxus's ErrorBoundary.
 - @defer with @placeholder, @loading, and @error blocks, lowered to Dioxus suspense/error boundaries.
 
@@ -45,8 +45,8 @@ Expressions inside interpolation and bindings are Rust expressions, not TypeScri
 This macro is a syntax frontend, not a port of Angular's complete compiler or runtime. In particular:
 
 - @defer currently selects a Dioxus suspense fallback but does not implement Angular's idle/viewport/interaction/timer trigger scheduling or automatic JavaScript chunk splitting. Trigger clauses are parsed for forward compatibility but do not change runtime behavior.
-- Angular @if (...; as alias) is rejected with a diagnostic. Use @let for Rust-scoped bindings.
-- #templateRef / ref-name declarations do not have Angular's template variable semantics; Dioxus node references must be created in Rust and passed explicitly.
+- Angular @if (...; as alias) is mapped to Rust Option matching: the condition must evaluate to Option<T>.
+- #templateRef / ref-name declarations do not have Angular's template variable semantics; declare a Dioxus NodeRef in Rust and use the same identifier in the template.
 - Angular directives, pipes, dependency injection, JavaScript truthiness, signal-specific TypeScript unwrapping, and Angular input/output metadata are not synthesized. Components must be ordinary Dioxus components with Rust props/events.
 - Angular's $index, $first, $last, $even, $odd, and $count loop locals are not injected. Use Rust iterator expressions and explicit item bindings.
 
