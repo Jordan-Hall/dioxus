@@ -316,13 +316,28 @@ impl<'a> Parser<'a> {
         self.consume_control("boundary")?;
         self.skip_ws();
         self.expect_char('{')?;
-        let body = self.parse_nodes(None, true, Some("error"))?;
+        let body = self.parse_nodes(None, true, None)?;
+        let previous = self.pos;
+        self.skip_ws();
         let mut error = None;
         if self.at_control("error") {
             self.consume_control("error")?;
-            error = Some(self.parse_block()?);
             self.skip_ws();
-            self.expect_char('}')?;
+            if self.peek_char() == Some('(') {
+                let parameters = self.read_parenthesized()?;
+                if !parameters.trim().is_empty() {
+                    return self.error("conditional @error blocks are not supported yet; use one unconditional @error block");
+                }
+            }
+            error = Some(self.parse_block()?);
+            let next = self.pos;
+            self.skip_ws();
+            if self.at_control("error") {
+                return self.error("only one unconditional @error block is supported for @boundary");
+            }
+            self.pos = next;
+        } else {
+            self.pos = previous;
         }
         Ok(Node::Boundary { body, error })
     }
@@ -993,6 +1008,20 @@ mod tests {
         assert!(rsx.contains("let count = total"));
         assert!(rsx.contains("__angular_switch_value"));
         assert!(rsx.contains("if true"));
+    }
+
+    #[test]
+    fn parses_boundary_with_connected_error_block() {
+        let rsx = lower(r#"@boundary { <p>Content</p> } @error { <p>Failed</p> }"#);
+        assert!(rsx.contains("ErrorBoundary"));
+        assert!(rsx.contains("handle_error"));
+        assert!(rsx.contains("Failed"));
+    }
+
+    #[test]
+    fn parses_if_option_alias() {
+        let rsx = lower(r#"@if (user; as user) { <p>{{ user.name }}</p> } @else { <p>Anonymous</p> }"#);
+        assert!(rsx.contains("if let Some(user) = (user)"));
     }
 
     #[test]
