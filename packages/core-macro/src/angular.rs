@@ -711,15 +711,44 @@ fn render_element(el: &Element) -> Result<String, String> {
                 let value = required_value(attr)?;
                 if let Some(property) = name.strip_prefix("attr.") {
                     fields.push(format!("{}: {{ {value} }}", render_attribute_name(property)));
+                } else if let Some(class_name) = name.strip_prefix("class.") {
+                    let class_name = syn::LitStr::new(class_name, Span::call_site()).to_token_stream().to_string();
+                    fields.push(format!("class: if {{ {value} }} {{ {class_name} }} else {{ \"\" }}"));
+                } else if let Some(style_name) = name.strip_prefix("style.") {
+                    let mut style_parts = style_name.splitn(2, '.');
+                    let property = style_parts.next().unwrap_or(style_name).replace('_', "-");
+                    let unit = style_parts.next().unwrap_or("");
+                    let style_template = format!("{property}: {{{{ {value} }}}}{unit};");
+                    fields.push(format!("style: {}", render_interpolated_string(&style_template)));
                 } else {
                     fields.push(format!("{}: {{ {value} }}", render_attribute_name(name)));
                 }
             }
             AttributeKind::Event(event) => {
                 let value = required_value(attr)?.replace("$event", "__angular_event");
+                let parts = event.split('.').collect::<Vec<_>>();
+                let key_modifier = parts.iter().skip(1).find_map(|modifier| match *modifier {
+                    "enter" => Some("Enter"),
+                    "escape" | "esc" => Some("Escape"),
+                    "space" => Some(" "),
+                    "tab" => Some("Tab"),
+                    "delete" => Some("Delete"),
+                    "backspace" => Some("Backspace"),
+                    "arrowup" => Some("ArrowUp"),
+                    "arrowdown" => Some("ArrowDown"),
+                    "arrowleft" => Some("ArrowLeft"),
+                    "arrowright" => Some("ArrowRight"),
+                    _ => None,
+                });
+                let event_name = if key_modifier.is_some() { parts[0] } else { event.as_str() };
+                let handler = if let Some(key) = key_modifier {
+                    format!("if __angular_event.key() == {key:?} {{ {value}; }}")
+                } else {
+                    format!("{value};")
+                };
                 fields.push(format!(
-                    "{}: move |__angular_event| {{ {value}; }}",
-                    render_attribute_name(&format!("on{}", normalize_event_name(event)))
+                    "{}: move |__angular_event| {{ {handler} }}",
+                    render_attribute_name(&format!("on{}", normalize_event_name(event_name)))
                 ));
             }
             AttributeKind::TwoWay(name) => {
@@ -802,7 +831,16 @@ fn inject_track_keys(nodes: &mut [Node], track: &str) {
     }
 }
 
-fn normalize_event_name(event: &str) -> String { event.trim().replace('-', "_") }
+fn normalize_event_name(event: &str) -> String {
+    match event.trim() {
+        "double-click" => "dblclick".to_owned(),
+        "mouse-enter" => "mouseenter".to_owned(),
+        "mouse-leave" => "mouseleave".to_owned(),
+        "pointer-down" => "pointerdown".to_owned(),
+        "pointer-up" => "pointerup".to_owned(),
+        event => event.replace('-', "_"),
+    }
+}
 
 fn is_boolean_attribute(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(),
@@ -990,6 +1028,15 @@ mod tests {
         assert!(rsx.contains("oninput"));
         assert!(rsx.contains("save(__angular_event)"));
         assert!(rsx.contains("name).set"));
+    }
+
+    #[test]
+    fn parses_class_style_and_key_event_bindings() {
+        let rsx = lower(r#"<button [class.active]="active" [style.width.px]="width" (keydown.enter)="submit($event)">Go</button>"#);
+        assert!(rsx.contains("class: if"));
+        assert!(rsx.contains("width: {width}px"));
+        assert!(rsx.contains("onkeydown"));
+        assert!(rsx.contains("__angular_event.key()"));
     }
 
     #[test]
