@@ -10,7 +10,14 @@ enum Node {
     Text(String),
     Element(Element),
     If { branches: Vec<(String, Vec<Node>)>, otherwise: Option<Vec<Node>>, alias: Option<String> },
-    For { pattern: String, iterable: String, track: Option<String>, body: Vec<Node>, empty: Option<Vec<Node>> },
+    For {
+        pattern: String,
+        iterable: String,
+        track: String,
+        aliases: Vec<(String, String)>,
+        body: Vec<Node>,
+        empty: Option<Vec<Node>>,
+    },
     Switch { expression: String, cases: Vec<(Option<String>, Vec<Node>)> },
     Let { name: String, expression: String },
     Defer { body: Vec<Node>, placeholder: Option<Vec<Node>>, loading: Option<Vec<Node>>, error: Option<Vec<Node>> },
@@ -181,7 +188,9 @@ impl<'a> Parser<'a> {
         if pattern.is_empty() || iterable.is_empty() {
             return self.error("@for requires both an item pattern and an iterable");
         }
+
         let mut track = None;
+        let mut aliases: Vec<(String, String)> = Vec::new();
         for part in parts {
             let part = part.trim();
             if let Some(expr) = part.strip_prefix("track ") {
@@ -192,14 +201,37 @@ impl<'a> Parser<'a> {
                     return self.error("@for track clause requires an expression");
                 }
                 track = Some(expr.trim().to_owned());
+            } else if let Some(declarations) = part.strip_prefix("let ") {
+                for declaration in split_top_level(declarations, ',') {
+                    let Some((name, context)) = split_once_top_level(&declaration, '=') else {
+                        return self.error("loop aliases use `let alias = $index`");
+                    };
+                    let name = name.trim().to_owned();
+                    let context = context.trim().to_owned();
+                    if !is_rust_ident(&name) {
+                        return self.error("loop alias must be a Rust identifier");
+                    }
+                    if !matches!(context.as_str(), "$index" | "$count" | "$first" | "$last" | "$even" | "$odd") {
+                        return self.error(&format!("unknown Angular loop context variable `{context}`"));
+                    }
+                    if aliases.iter().any(|existing| existing.0 == name) {
+                        return self.error(&format!("duplicate loop alias `{name}`"));
+                    }
+                    aliases.push((name, context));
+                }
             } else if !part.is_empty() {
                 return self.error(&format!("unsupported @for clause: {part}"));
             }
         }
+
+        let Some(mut track) = track else {
+            return self.error("@for requires a track expression, for example `track item.id`");
+        };
         let mut body = self.parse_block()?;
-        if let Some(track_expr) = track.as_deref() {
-            inject_track_keys(&mut body, track_expr);
-        }
+        rewrite_loop_locals(&mut body);
+        track = rewrite_expression_loop_locals(&track);
+        inject_track_keys(&mut body, &track);
+
         let previous = self.pos;
         self.skip_ws();
         let empty = if self.at_control("empty") {
@@ -209,7 +241,8 @@ impl<'a> Parser<'a> {
             self.pos = previous;
             None
         };
-        Ok(Node::For { pattern, iterable, track, body, empty })
+
+        Ok(Node::For { pattern, iterable, track, aliases, body, empty })
     }
 
     fn parse_switch(&mut self) -> Result<Node, String> {
