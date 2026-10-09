@@ -32,3 +32,31 @@ fn angular_loop_compiles() -> Element {
         "#
     )
 }
+
+#[allow(dead_code)]
+fn angular_defer_compiles() -> Element {
+    angular!(
+        r#"
+        @defer (on viewport) {
+            <section>Deferred content</section>
+        } @placeholder (minimum 500ms) {
+            <p>Loading</p>
+        } @error {
+            <p>Failed to load</p>
+        }
+        "#
+    )
+}
+
+#[allow(dead_code)]
+fn angular_boundary_compiles() -> Element {
+    angular!(
+        r#"
+        @boundary {
+            <section>Protected content</section>
+        } @error {
+            <p>Something failed</p>
+        }
+        "#
+    )
+}
