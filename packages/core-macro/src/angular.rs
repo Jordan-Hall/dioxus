@@ -929,7 +929,8 @@ fn rewrite_expression_loop_locals(source: &str) -> String {
             pos += ch.len_utf8();
             continue;
         }
-        if ch == '
+        if ch == '$' {
+            let rest = &source[pos..];
             let end = rest.char_indices().skip(1)
                 .take_while(|(_, next)| next.is_ascii_alphanumeric() || *next == '_')
                 .last()
