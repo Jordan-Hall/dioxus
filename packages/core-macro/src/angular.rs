@@ -106,7 +106,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
-            let text = self.parse_text(stop_brace);
+            let text = self.parse_text(stop_brace)?;
             if !text.is_empty() {
                 nodes.push(Node::Text(text));
             } else if self.pos < self.source.len() {
@@ -478,7 +478,7 @@ impl<'a> Parser<'a> {
         Ok(decode_html_entities(&self.source[start..self.pos]))
     }
 
-    fn parse_text(&mut self, stop_brace: bool) -> String {
+    fn parse_text(&mut self, stop_brace: bool) -> Result<String, String> {
         let start = self.pos;
         while self.pos < self.source.len() {
             if self.starts_with("{{") {
@@ -486,6 +486,7 @@ impl<'a> Parser<'a> {
                     self.pos = end + 2;
                     continue;
                 }
+                return self.error("unterminated interpolation; expected closing braces");
             }
             if self.is_tag_start() || self.starts_with("</")
                 || (self.source[self.pos..].starts_with('@') && self.is_known_control_start())
@@ -495,7 +496,7 @@ impl<'a> Parser<'a> {
             }
             self.bump_char();
         }
-        self.source[start..self.pos].to_owned()
+        Ok(self.source[start..self.pos].to_owned())
     }
 
     fn read_parenthesized(&mut self) -> Result<String, String> {
@@ -738,14 +739,14 @@ fn render_node(node: &Node) -> Result<String, String> {
                     render_nodes(error_nodes)?
                 ))
             } else {
-                Ok(format!("SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }}"))
+                Ok(format!("::dioxus::prelude::SuspenseBoundary {{ fallback: move |_| ::dioxus::prelude::rsx! {{ {fallback} }}, {body} }}"))
             }
         }
         Node::Boundary { body, error } => {
             if let Some(error) = error {
-                Ok(format!("ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, {} }}", render_nodes(error)?, render_nodes(body)?))
+                Ok(format!("::dioxus::prelude::ErrorBoundary {{ handle_error: move |_| ::dioxus::prelude::rsx! {{ {} }}, {} }}", render_nodes(error)?, render_nodes(body)?))
             } else {
-                Ok(format!("ErrorBoundary {{ {} }}", render_nodes(body)?))
+                Ok(format!("::dioxus::prelude::ErrorBoundary {{ {} }}", render_nodes(body)?))
             }
         }
         Node::Let { .. } => unreachable!(),
@@ -1316,6 +1317,20 @@ mod tests {
         assert!(rsx.contains("ErrorBoundary"));
         assert!(rsx.contains("handle_error"));
         assert!(rsx.contains("Failed"));
+    }
+
+    #[test]
+    fn parses_defer_triggers_with_whitespace() {
+        let rsx = lower(r#"@defer (on viewport) { <p>Lazy</p> } @placeholder (minimum 500ms) { <p>Wait</p> }"#);
+        assert!(rsx.contains("SuspenseBoundary"));
+        assert!(rsx.contains("Lazy"));
+        assert!(rsx.contains("Wait"));
+    }
+
+    #[test]
+    fn rejects_unterminated_interpolation() {
+        let error = Parser::new("<p>{{ value</p>").parse().unwrap_err();
+        assert!(error.contains("unterminated interpolation"));
     }
 
     #[test]
